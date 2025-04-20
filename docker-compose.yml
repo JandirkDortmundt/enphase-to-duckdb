@@ -1,0 +1,56 @@
+# Use version 3 of the Docker Compose file format
+version: '3'
+
+# Define the services (containers)
+services:
+  # Define the Kafka broker service
+  kafka:
+    # Use a Kafka image that supports KRaft. Bitnami images are good for simple setups.
+    # This image includes Kafka and handles the KRaft setup.
+    image: bitnami/kafka:3.6.1
+    # Restart the container if it stops, unless explicitly stopped
+    restart: unless-stopped
+    # Map ports from the host to the container
+    # 9092 is the default port for client connections
+    ports:
+      - "9092:9092"
+    # Define environment variables for Kafka configuration
+    environment:
+      # KRaft Configuration
+      - KAFKA_CFG_NODE_ID=1 # Unique ID for this Kafka node
+      # Define the roles this node plays: controller, broker, or both
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      # Define listeners for different types of connections
+      # PLAINTEXT is for client connections (outside the docker network)
+      # CONTROLLER is for inter-broker communication within the KRaft quorum
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      # Define how clients outside the Docker network connect
+      # Must match the PLAINTEXT listener and use the host machine's address (localhost)
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092
+      # Define the controller quorum voters in the format node_id@hostname:port
+      # For a single-node KRaft cluster, it's just the node itself.
+      # 'kafka' is the service name in this docker-compose file.
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      # Specify the names of the controller listeners
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      # KRaft Cluster ID - Reads from the KAFKA_CLUSTER_ID environment variable
+      # This variable should be defined in a .env file next to this docker-compose.yml
+      - KAFKA_KRAFT_CLUSTER_ID=${KAFKA_CLUSTER_ID}
+      # Allow topics to be automatically created when a producer sends data to a non-existent topic
+      # Useful for testing, but often disabled in production.
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+
+      # General Kafka Configuration (optional but common)
+      # - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data # Default log directory inside the container
+      # - KAFKA_CFG_NUM_PARTITIONS=1 # Default number of partitions for new topics
+
+    # Define volumes for persistent data storage
+    # This ensures your Kafka data (like messages) persists even if the container is removed
+    volumes:
+      - kafka_data:/bitnami/kafka # Mount a named volume to the Kafka data directory
+
+# Define named volumes used by the services
+volumes:
+  kafka_data:
+    driver: local # Use the local storage driver
+
