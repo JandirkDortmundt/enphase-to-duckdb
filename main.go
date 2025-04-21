@@ -9,27 +9,18 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv" // Needed to parse expiry timestamp from string
+	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/segmentio/kafka-go"
-	// Import the new token_refresher package
-	// Assuming token_refresher.go is in the same module or a sub-package
-	// If in the same directory and same module, you can import it directly
-	// If in a sub-directory like ./tokenrefresher, import as "your_module_path/tokenrefresher"
-	// For simplicity, let's assume it's in the same package for now.
-	// You might need to adjust the import path based on your go.mod and file structure.
-	// Example if in the same directory/module:
-	// "." // This assumes token_refresher.go is in the same directory and package main
-	// However, it's better practice to put it in a separate package.
-	// Let's assume you create a package named 'tokenrefresher' in a sub-directory.
-	// You would need to change 'package main' to 'package tokenrefresher' in token_refresher.go
-	// And your go.mod would define your module path, e.g., module my/enphase_publisher
-	// Then the import would be: "my/enphase_publisher/tokenrefresher"
-	// For now, let's assume it's in the same package for simplicity, but be aware of best practices.
-	// If in the same package, the functions are directly available.
-	// If in a different package, you'd call tokenrefresher.RefreshAndSaveToken
+
+	// Import the tokenrefresher package
+	// Assuming token_refresher.go is in a sub-directory named 'tokenrefresher'
+	// and your go.mod defines your module path (e.g., module my/enphase_publisher)
+	// The import path would then be "my/enphase_publisher/tokenrefresher"
+	// You MUST adjust the import path below to match your actual module path and directory structure.
+	"/home/jd/workspace/enphase/tokenrefresher/tokenrefresher"
 )
 
 // Configuration variables - Read from environment
@@ -39,8 +30,14 @@ var (
 	kafkaBroker       string
 	kafkaTopic        string
 	fetchInterval     = 10 * time.Second
-	envoyToken        string // Variable to hold the current token
-	tokenExpiry       int64  // Unix timestamp for token expiry
+
+	// Owner token for data fetching
+	envoyOwnerToken  string
+	ownerTokenExpiry int64
+
+	// Installer token for communication check
+	envoyInstallerToken  string
+	installerTokenExpiry int64
 )
 
 // State variable to store the last reported date for each inverter
@@ -87,38 +84,64 @@ func init() {
 		log.Fatal("KAFKA_TOPIC environment variable not set")
 	}
 
-	// Read the Envoy token and expiry from environment variables
-	envoyToken = os.Getenv("ENVOY_TOKEN")
-	expiryStr := os.Getenv("ENVOY_TOKEN_EXPIRY")
+	// --- NEW: Read and manage both Owner and Installer tokens ---
 
-	// --- NEW: Handle missing or expired token on startup ---
-	if envoyToken == "" || expiryStr == "" {
-		log.Println("ENVOY_TOKEN or ENVOY_TOKEN_EXPIRY not found. Attempting initial token refresh...")
-		// Attempt initial refresh if token or expiry is missing
-		err := performTokenRefresh() // Call the refresh function
+	// Read Owner token and expiry
+	envoyOwnerToken = os.Getenv("ENVOY_TOKEN")
+	ownerExpiryStr := os.Getenv("ENVOY_TOKEN_EXPIRY")
+
+	// Read Installer token and expiry
+	envoyInstallerToken = os.Getenv("ENVOY_INSTALLER_TOKEN")
+	installerExpiryStr := os.Getenv("ENVOY_INSTALLER_TOKEN_EXPIRY")
+
+	// Attempt initial refresh for Owner token if missing or expired
+	if envoyOwnerToken == "" || ownerExpiryStr == "" {
+		log.Println("Owner token or expiry not found. Attempting initial OWNER token refresh...")
+		err := performOwnerTokenRefresh()
 		if err != nil {
-			log.Fatalf("Initial token refresh failed: %v", err)
+			log.Fatalf("Initial OWNER token refresh failed: %v", err)
 		}
-		// After successful refresh, the .env is updated. Reload it to get the new values.
-		err = godotenv.Load()
-		if err != nil {
-			log.Fatalf("Failed to reload .env after initial refresh: %v", err)
-		}
-		// Read the newly refreshed token and expiry
-		envoyToken = os.Getenv("ENVOY_TOKEN")
-		expiryStr = os.Getenv("ENVOY_TOKEN_EXPIRY")
-		if envoyToken == "" || expiryStr == "" {
-			log.Fatal("Token refresh succeeded, but ENVOY_TOKEN or ENVOY_TOKEN_EXPIRY still not found after reloading .env")
+		// Reload .env after successful refresh
+		godotenv.Load() // Ignore error, will fatal below if still missing
+		envoyOwnerToken = os.Getenv("ENVOY_TOKEN")
+		ownerExpiryStr = os.Getenv("ENVOY_TOKEN_EXPIRY")
+		if envoyOwnerToken == "" || ownerExpiryStr == "" {
+			log.Fatal("Owner token refresh succeeded, but ENVOY_TOKEN or ENVOY_TOKEN_EXPIRY still not found after reloading .env")
 		}
 	}
 
-	// Parse the expiry timestamp string to int64
-	parsedExpiry, err := strconv.ParseInt(expiryStr, 10, 64)
+	// Attempt initial refresh for Installer token if missing or expired
+	if envoyInstallerToken == "" || installerExpiryStr == "" {
+		log.Println("Installer token or expiry not found. Attempting initial INSTALLER token refresh...")
+		err := performInstallerTokenRefresh()
+		if err != nil {
+			log.Fatalf("Initial INSTALLER token refresh failed: %v", err)
+		}
+		// Reload .env after successful refresh
+		godotenv.Load() // Ignore error, will fatal below if still missing
+		envoyInstallerToken = os.Getenv("ENVOY_INSTALLER_TOKEN")
+		installerExpiryStr = os.Getenv("ENVOY_INSTALLER_TOKEN_EXPIRY")
+		if envoyInstallerToken == "" || installerExpiryStr == "" {
+			log.Fatal("Installer token refresh succeeded, but ENVOY_INSTALLER_TOKEN or ENVOY_INSTALLER_TOKEN_EXPIRY still not found after reloading .env")
+		}
+	}
+
+	// Parse Owner expiry timestamp string to int64
+	parsedOwnerExpiry, err := strconv.ParseInt(ownerExpiryStr, 10, 64)
 	if err != nil {
-		log.Printf("Warning: Could not parse ENVOY_TOKEN_EXPIRY '%s' as int64: %v. Token will be treated as expired.", expiryStr, err)
-		tokenExpiry = 0 // Treat as expired if parsing fails
+		log.Printf("Warning: Could not parse ENVOY_TOKEN_EXPIRY '%s' as int64: %v. Owner token will be treated as expired.", ownerExpiryStr, err)
+		ownerTokenExpiry = 0 // Treat as expired if parsing fails
 	} else {
-		tokenExpiry = parsedExpiry
+		ownerTokenExpiry = parsedOwnerExpiry
+	}
+
+	// Parse Installer expiry timestamp string to int64
+	parsedInstallerExpiry, err := strconv.ParseInt(installerExpiryStr, 10, 64)
+	if err != nil {
+		log.Printf("Warning: Could not parse ENVOY_INSTALLER_TOKEN_EXPIRY '%s' as int64: %v. Installer token will be treated as expired.", installerExpiryStr, err)
+		installerTokenExpiry = 0 // Treat as expired if parsing fails
+	} else {
+		installerTokenExpiry = parsedInstallerExpiry
 	}
 	// --- END NEW ---
 
@@ -134,7 +157,8 @@ func init() {
 
 	log.Printf("Configuration loaded: EnvoyURL=%s, CommCheckURL=%s, KafkaBroker=%s, KafkaTopic=%s, FetchInterval=%s",
 		envoyURL, envoyCommCheckURL, kafkaBroker, kafkaTopic, fetchInterval)
-	log.Printf("Current token expires at %s (Unix: %d)", time.Unix(tokenExpiry, 0).UTC().Format(time.RFC3339), tokenExpiry)
+	log.Printf("Current OWNER token expires at %s (Unix: %d)", time.Unix(ownerTokenExpiry, 0).UTC().Format(time.RFC3339), ownerTokenExpiry)
+	log.Printf("Current INSTALLER token expires at %s (Unix: %d)", time.Unix(installerTokenExpiry, 0).UTC().Format(time.RFC3339), installerTokenExpiry)
 }
 
 func main() {
@@ -166,7 +190,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initial fetch to populate state (using the potentially newly refreshed token)
+	// Initial fetch to populate state (using the potentially newly refreshed OWNER token)
 	log.Println("Performing initial fetch to populate state...")
 	fetchAndPopulateState(ctx)
 
@@ -175,41 +199,65 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			// --- NEW: Check token expiry before each cycle ---
-			// Refresh if less than 5 minutes until expiry (or already expired)
-			if time.Now().Unix()+300 >= tokenExpiry { // Check 5 minutes before expiry
-				log.Println("Token is expired or nearing expiry. Attempting to refresh token...")
-				err := performTokenRefresh() // Call the refresh function
+			// --- NEW: Check BOTH token expiries before each cycle ---
+			// Refresh Owner token if needed
+			if time.Now().Unix()+300 >= ownerTokenExpiry { // Check 5 minutes before expiry
+				log.Println("Owner token is expired or nearing expiry. Attempting to refresh OWNER token...")
+				err := performOwnerTokenRefresh()
 				if err != nil {
-					log.Printf("Token refresh failed: %v. Continuing with potentially expired token.", err)
+					log.Printf("OWNER token refresh failed: %v. Continuing with potentially expired token.", err)
 					// Decide if you want to stop or continue with the old token
 				} else {
 					// If refresh successful, reload .env to get the new token and expiry
-					err = godotenv.Load()
-					if err != nil {
-						log.Printf("Failed to reload .env after refresh: %v. Continuing with old token.", err)
-					} else {
-						envoyToken = os.Getenv("ENVOY_TOKEN")
-						expiryStr := os.Getenv("ENVOY_TOKEN_EXPIRY")
-						if expiryStr != "" {
-							parsedExpiry, err := strconv.ParseInt(expiryStr, 10, 64)
-							if err == nil {
-								tokenExpiry = parsedExpiry
-								log.Printf("Successfully refreshed token. New token expires at %s (Unix: %d)", time.Unix(tokenExpiry, 0).UTC().Format(time.RFC3339), tokenExpiry)
-							} else {
-								log.Printf("Warning: Could not parse new ENVOY_TOKEN_EXPIRY '%s' after refresh: %v. Token will be treated as expired.", expiryStr, err)
-								tokenExpiry = 0 // Treat as expired
-							}
+					godotenv.Load() // Ignore error, will fatal below if still missing
+					envoyOwnerToken = os.Getenv("ENVOY_TOKEN")
+					ownerExpiryStr := os.Getenv("ENVOY_TOKEN_EXPIRY")
+					if ownerExpiryStr != "" {
+						parsedExpiry, err := strconv.ParseInt(ownerExpiryStr, 10, 64)
+						if err == nil {
+							ownerTokenExpiry = parsedExpiry
+							log.Printf("Successfully refreshed OWNER token. New token expires at %s (Unix: %d)", time.Unix(ownerTokenExpiry, 0).UTC().Format(time.RFC3339), ownerTokenExpiry)
 						} else {
-							log.Println("Warning: ENVOY_TOKEN_EXPIRY not found in .env after refresh. Token will be treated as expired.")
-							tokenExpiry = 0 // Treat as expired
+							log.Printf("Warning: Could not parse new ENVOY_TOKEN_EXPIRY '%s' after refresh: %v. Owner token will be treated as expired.", ownerExpiryStr, err)
+							ownerTokenExpiry = 0
 						}
+					} else {
+						log.Println("Warning: ENVOY_TOKEN_EXPIRY not found in .env after OWNER refresh. Owner token will be treated as expired.")
+						ownerTokenExpiry = 0
+					}
+				}
+			}
+
+			// Refresh Installer token if needed
+			if time.Now().Unix()+300 >= installerTokenExpiry { // Check 5 minutes before expiry
+				log.Println("Installer token is expired or nearing expiry. Attempting to refresh INSTALLER token...")
+				err := performInstallerTokenRefresh()
+				if err != nil {
+					log.Printf("INSTALLER token refresh failed: %v. Continuing with potentially expired token.", err)
+					// Decide if you want to stop or continue with the old token
+				} else {
+					// If refresh successful, reload .env to get the new token and expiry
+					godotenv.Load() // Ignore error, will fatal below if still missing
+					envoyInstallerToken = os.Getenv("ENVOY_INSTALLER_TOKEN")
+					installerExpiryStr := os.Getenv("ENVOY_INSTALLER_TOKEN_EXPIRY")
+					if installerExpiryStr != "" {
+						parsedExpiry, err := strconv.ParseInt(installerExpiryStr, 10, 64)
+						if err == nil {
+							installerTokenExpiry = parsedExpiry
+							log.Printf("Successfully refreshed INSTALLER token. New token expires at %s (Unix: %d)", time.Unix(installerTokenExpiry, 0).UTC().Format(time.RFC3339), installerTokenExpiry)
+						} else {
+							log.Printf("Warning: Could not parse new ENVOY_INSTALLER_TOKEN_EXPIRY '%s' after refresh: %v. Installer token will be treated as expired.", installerExpiryStr, err)
+							installerTokenExpiry = 0
+						}
+					} else {
+						log.Println("Warning: ENVOY_INSTALLER_TOKEN_EXPIRY not found in .env after INSTALLER refresh. Installer token will be treated as expired.")
+						installerTokenExpiry = 0
 					}
 				}
 			}
 			// --- END NEW ---
 
-			// Proceed with fetching and publishing using the current (potentially refreshed) token
+			// Proceed with fetching and publishing using the current (potentially refreshed) tokens
 			fetchTriggerAndPublish(ctx, writer)
 		case <-ctx.Done():
 			log.Println("Context cancelled, shutting down.")
@@ -218,39 +266,50 @@ func main() {
 	}
 }
 
-// performTokenRefresh calls the token refresher logic and updates global variables.
-// This helper function is called from main and init.
-func performTokenRefresh() error {
-	// Call the RefreshAndSaveToken function from token_refresher.go
-	// Assuming RefreshAndSaveToken is in the same package or imported correctly
-	// If in a separate package 'tokenrefresher', call:
-	// newToken, newExpiry, err := tokenrefresher.RefreshAndSaveToken()
-	// For simplicity, assuming same package for now:
-	newToken, newExpiry, err := RefreshAndSaveToken() // Call the function from token_refresher.go
+// performOwnerTokenRefresh calls the token refresher logic for the Owner token.
+func performOwnerTokenRefresh() error {
+	// Call the RefreshAndSaveOwnerToken function from the tokenrefresher package
+	// ADJUST THE CALL BASED ON YOUR IMPORT PATH
+	newToken, newExpiry, err := tokenrefresher.RefreshAndSaveOwnerToken()
 	if err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
+		return fmt.Errorf("owner token refresh failed: %w", err)
 	}
 
 	// Update global variables (these will also be reloaded from .env by godotenv.Load in the caller)
-	envoyToken = newToken
-	tokenExpiry = newExpiry
+	envoyOwnerToken = newToken
+	ownerTokenExpiry = newExpiry
+
+	return nil
+}
+
+// performInstallerTokenRefresh calls the token refresher logic for the Installer token.
+func performInstallerTokenRefresh() error {
+	// Call the RefreshAndSaveInstallerToken function from the tokenrefresher package
+	// ADJUST THE CALL BASED ON YOUR IMPORT PATH
+	newToken, newExpiry, err := tokenrefresher.RefreshAndSaveInstallerToken()
+	if err != nil {
+		return fmt.Errorf("installer token refresh failed: %w", err)
+	}
+
+	// Update global variables (these will also be reloaded from .env by godotenv.Load in the caller)
+	envoyInstallerToken = newToken
+	installerTokenExpiry = newExpiry
 
 	return nil
 }
 
 // fetchAndPopulateState fetches data from Envoy and populates the lastReportDates map
-// Used on initial startup.
+// Used on initial startup. Uses the OWNER token.
 func fetchAndPopulateState(ctx context.Context) {
 	log.Printf("Attempting initial fetch from Envoy at %s", envoyURL)
 
-	// --- MODIFIED: Declare req and resp using := ---
 	req, err := http.NewRequestWithContext(ctx, "GET", envoyURL, nil)
 	if err != nil {
 		log.Printf("Error creating HTTP request for initial fetch: %v", err)
 		return
 	}
 	req.Header.Add("Accept", "application/json")
-	req.Header.Add("Authorization", "Bearer "+envoyToken) // Use the current token
+	req.Header.Add("Authorization", "Bearer "+envoyOwnerToken) // Use the OWNER token
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -293,17 +352,18 @@ func fetchAndPopulateState(ctx context.Context) {
 	log.Printf("Initial state populated for %d inverters.", len(lastReportDates))
 }
 
-// fetchTriggerAndPublish calls the communication check endpoint, waits, then fetches and publishes new data
+// fetchTriggerAndPublish calls the communication check endpoint, waits, then fetches and publishes new data.
+// Uses the INSTALLER token for the comm check and the OWNER token for data fetching.
 func fetchTriggerAndPublish(ctx context.Context, writer *kafka.Writer) {
 	log.Printf("Attempting to trigger Envoy communication check at %s", envoyCommCheckURL)
 
-	// Call the communication check endpoint
+	// Call the communication check endpoint using the INSTALLER token
 	reqTrigger, err := http.NewRequestWithContext(ctx, "POST", envoyCommCheckURL, nil) // Assuming POST
 	if err != nil {
 		log.Printf("Error creating HTTP request for comm check: %v", err)
 		// Continue to fetch anyway
 	} else {
-		reqTrigger.Header.Add("Authorization", "Bearer "+envoyToken) // Use the current token
+		reqTrigger.Header.Add("Authorization", "Bearer "+envoyInstallerToken) // Use the INSTALLER token
 
 		clientTrigger := &http.Client{
 			Timeout: 5 * time.Second,
@@ -334,10 +394,9 @@ func fetchTriggerAndPublish(ctx context.Context, writer *kafka.Writer) {
 	time.Sleep(2 * time.Second)
 	log.Println("Waiting briefly after triggering communication check.")
 
-	// Existing logic to fetch from /api/v1/production/inverters
+	// Existing logic to fetch from /api/v1/production/inverters using the OWNER token
 	log.Printf("Attempting to fetch data from Envoy at %s after trigger", envoyURL)
 
-	// --- MODIFIED: Declare req and resp using := ---
 	req, err := http.NewRequestWithContext(ctx, "GET", envoyURL, nil)
 	if err != nil {
 		log.Printf("Error creating HTTP request for inverter data: %v", err)
@@ -345,7 +404,7 @@ func fetchTriggerAndPublish(ctx context.Context, writer *kafka.Writer) {
 	}
 
 	req.Header.Add("Accept", "application/json")
-	req.Header.Add("Authorization", "Bearer "+envoyToken) // Use the current token
+	req.Header.Add("Authorization", "Bearer "+envoyOwnerToken) // Use the OWNER token
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,

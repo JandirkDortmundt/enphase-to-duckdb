@@ -1,7 +1,7 @@
-package main
+package tokenrefresher // Use a separate package for better organization
 
 import (
-	//"bytes" // Needed for sending JSON body in POST requests
+	"bytes" // Needed for sending JSON body in POST requests
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,23 +43,38 @@ type EntrezTokenResponse struct {
 	ExpiresAt      int64  `json:"expires_at"` // Unix timestamp
 }
 
-// RefreshAndSaveToken logs in to Enphase cloud, gets a new token using the authenticated GET URL method,
-// and saves it to the .env file. It returns the new token and its expiry timestamp.
-func RefreshAndSaveToken() (string, int64, error) {
-	log.Println("Attempting to refresh Enphase token using Login + Authenticated GET URL method...")
+// RefreshAndSaveOwnerToken logs in with owner credentials, gets an owner token, and saves it to the .env file.
+func RefreshAndSaveOwnerToken() (string, int64, error) {
+	log.Println("Attempting to refresh Enphase OWNER token using Login + Authenticated GET URL method...")
+	// Call the internal refresh function with keys for owner credentials and token storage
+	return refreshAndSaveTokenInternal("ENPHASE_USERNAME", "ENPHASE_PASSWORD", "ENVOY_TOKEN", "ENVOY_TOKEN_EXPIRY")
+}
+
+// RefreshAndSaveInstallerToken logs in with installer credentials, gets an installer token, and saves it to the .env file.
+func RefreshAndSaveInstallerToken() (string, int64, error) {
+	log.Println("Attempting to refresh Enphase INSTALLER token using Login + Authenticated GET URL method...")
+	// Call the internal refresh function with keys for installer credentials and token storage
+	return refreshAndSaveTokenInternal("ENPHASE_USERNAME_INSTALLER", "ENPHASE_PASSWORD_INSTALLER", "ENVOY_INSTALLER_TOKEN", "ENVOY_INSTALLER_TOKEN_EXPIRY")
+}
+
+// refreshAndSaveTokenInternal is a helper function to perform the token refresh logic for a given credential type.
+// It takes environment variable keys for username, password, and the keys to use when saving the token/expiry to .env.
+func refreshAndSaveTokenInternal(usernameEnvKey, passwordEnvKey, tokenEnvKey, expiryEnvKey string) (string, int64, error) {
 
 	// Load environment variables from .env file to get credentials
+	// We load again here to ensure we have the latest credentials if the .env file was edited manually
 	err := godotenv.Load()
 	if err != nil {
 		log.Printf("Warning: Error loading .env file in token refresh: %v (This is okay if credentials are set as system env vars)", err)
 	}
 
-	username := os.Getenv("ENPHASE_USERNAME")
-	password := os.Getenv("ENPHASE_PASSWORD")
-	gatewaySerial := os.Getenv("ENPHASE_GATEWAY")
+	// Read credentials and gateway serial from environment variables using the provided keys
+	username := os.Getenv(usernameEnvKey)
+	password := os.Getenv(passwordEnvKey)
+	gatewaySerial := os.Getenv("ENPHASE_GATEWAY") // Gateway serial is the same for both token types
 
 	if username == "" || password == "" || gatewaySerial == "" {
-		return "", 0, fmt.Errorf("ENPHASE_USERNAME, ENPHASE_PASSWORD, or ENPHASE_GATEWAY environment variables not set for token refresh")
+		return "", 0, fmt.Errorf("%s, %s, or ENPHASE_GATEWAY environment variables not set for token refresh", usernameEnvKey, passwordEnvKey)
 	}
 
 	// Create a cookie jar to manage cookies across requests
@@ -76,7 +91,7 @@ func RefreshAndSaveToken() (string, int64, error) {
 	}
 
 	// --- Step 1: Login to Enlighten to get a session ID and cookies ---
-	log.Println("Step 1: Logging in to Enlighten to get session cookies...")
+	log.Printf("Step 1: Logging in to Enlighten with %s credentials to get session cookies...", usernameEnvKey)
 
 	// Prepare form data for login (using url.Values for application/x-www-form-urlencoded)
 	loginData := url.Values{}
@@ -99,7 +114,7 @@ func RefreshAndSaveToken() (string, int64, error) {
 
 	// At this point, if login was successful (200 OK or 302 Redirect), the client's cookie jar
 	// should contain the session cookies set by the server.
-	log.Printf("Step 1 completed. Login request returned status: %d %s. Session cookies should be in the jar.",
+	log.Printf("Step 1 completed with status: %d %s. Session cookies should be in the jar.",
 		respLogin.StatusCode, respLogin.Status)
 
 	// Optional: Read and parse the login response body for session_id, though relying on cookies is key
@@ -162,7 +177,7 @@ func RefreshAndSaveToken() (string, int64, error) {
 		time.Unix(tokenResponse.ExpiresAt, 0).UTC().Format(time.RFC3339), tokenResponse.ExpiresAt)
 
 	// --- Step 3: Save the new token and expiry to the .env file ---
-	log.Println("Step 3: Saving new token and expiry to .env file...")
+	log.Printf("Step 3: Saving new token and expiry to .env file using keys %s and %s...", tokenEnvKey, expiryEnvKey)
 
 	// Read existing .env file content
 	envMap, err := godotenv.Read()
@@ -172,9 +187,9 @@ func RefreshAndSaveToken() (string, int64, error) {
 		log.Printf("Warning: Could not read existing .env file, creating new map: %v", err)
 	}
 
-	// Update the token and expiry values in the map
-	envMap["ENVOY_TOKEN"] = tokenResponse.Token
-	envMap["ENVOY_TOKEN_EXPIRY"] = strconv.FormatInt(tokenResponse.ExpiresAt, 10) // Save expiry as string
+	// Update the token and expiry values in the map using the provided keys
+	envMap[tokenEnvKey] = tokenResponse.Token
+	envMap[expiryEnvKey] = strconv.FormatInt(tokenResponse.ExpiresAt, 10) // Save expiry as string
 
 	// Write the updated map back to the .env file
 	// godotenv.Write is a convenient way to write the map to a file, preserving format if possible
@@ -189,16 +204,5 @@ func RefreshAndSaveToken() (string, int64, error) {
 	return tokenResponse.Token, tokenResponse.ExpiresAt, nil
 }
 
-// This file is intended to be imported and used by main.go, so it doesn't need a main function itself.
-// You could add a main function here for testing the refresh process independently if desired.
-/*
-func main() {
-	// Example of how to test the refresh process
-	// Ensure ENPHASE_USERNAME, ENPHASE_PASSWORD, ENPHASE_GATEWAY are set in your environment or .env
-	newToken, newExpiry, err := RefreshAndSaveToken()
-	if err != nil {
-		log.Fatalf("Token refresh failed: %v", err)
-	}
-	log.Printf("Successfully refreshed token: %s, expires at %d", newToken, newExpiry)
-}
-*/
+// This file defines functions within the 'tokenrefresher' package.
+// It does not have a main function and is intended to be imported by other Go files.
