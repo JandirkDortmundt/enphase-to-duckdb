@@ -20,7 +20,7 @@ import (
 	// and your go.mod defines your module path (e.g., module my/enphase_publisher)
 	// The import path would then be "my/enphase_publisher/tokenrefresher"
 	// You MUST adjust the import path below to match your actual module path and directory structure.
-	"/home/jd/workspace/enphase/tokenrefresher/tokenrefresher"
+	"enphase/tokenrefresher" // <-- ADJUST THIS IMPORT PATH
 )
 
 // Configuration variables - Read from environment
@@ -38,6 +38,10 @@ var (
 	// Installer token for communication check
 	envoyInstallerToken  string
 	installerTokenExpiry int64
+
+	// --- NEW: Configuration for enabling/disabling comm check ---
+	enableCommCheck bool
+	// --- END NEW ---
 )
 
 // State variable to store the last reported date for each inverter
@@ -84,6 +88,22 @@ func init() {
 		log.Fatal("KAFKA_TOPIC environment variable not set")
 	}
 
+	// --- NEW: Read and parse ENABLE_COMM_CHECK ---
+	enableCommCheckStr := os.Getenv("ENABLE_COMM_CHECK")
+	if enableCommCheckStr != "" {
+		parsedBool, err := strconv.ParseBool(enableCommCheckStr)
+		if err != nil {
+			log.Printf("Warning: Could not parse ENABLE_COMM_CHECK '%s' as boolean: %v. Defaulting to false.", enableCommCheckStr, err)
+			enableCommCheck = false // Default to false if parsing fails
+		} else {
+			enableCommCheck = parsedBool
+		}
+	} else {
+		log.Println("ENABLE_COMM_CHECK environment variable not set. Defaulting to false.")
+		enableCommCheck = false // Default to false if variable is not set
+	}
+	// --- END NEW ---
+
 	// --- NEW: Read and manage both Owner and Installer tokens ---
 
 	// Read Owner token and expiry
@@ -111,7 +131,8 @@ func init() {
 	}
 
 	// Attempt initial refresh for Installer token if missing or expired
-	if envoyInstallerToken == "" || installerExpiryStr == "" {
+	// Only attempt installer token refresh if comm check is enabled
+	if enableCommCheck && (envoyInstallerToken == "" || installerExpiryStr == "") {
 		log.Println("Installer token or expiry not found. Attempting initial INSTALLER token refresh...")
 		err := performInstallerTokenRefresh()
 		if err != nil {
@@ -136,12 +157,18 @@ func init() {
 	}
 
 	// Parse Installer expiry timestamp string to int64
-	parsedInstallerExpiry, err := strconv.ParseInt(installerExpiryStr, 10, 64)
-	if err != nil {
-		log.Printf("Warning: Could not parse ENVOY_INSTALLER_TOKEN_EXPIRY '%s' as int64: %v. Installer token will be treated as expired.", installerExpiryStr, err)
-		installerTokenExpiry = 0 // Treat as expired if parsing fails
+	// Only parse if comm check is enabled and token/expiry were found/refreshed
+	if enableCommCheck && installerExpiryStr != "" {
+		parsedInstallerExpiry, err := strconv.ParseInt(installerExpiryStr, 10, 64)
+		if err != nil {
+			log.Printf("Warning: Could not parse ENVOY_INSTALLER_TOKEN_EXPIRY '%s' as int64: %v. Installer token will be treated as expired.", installerExpiryStr, err)
+			installerTokenExpiry = 0 // Treat as expired if parsing fails
+		} else {
+			installerTokenExpiry = parsedInstallerExpiry
+		}
 	} else {
-		installerTokenExpiry = parsedInstallerExpiry
+		// If comm check is disabled or token/expiry not found, treat installer token as expired/unavailable
+		installerTokenExpiry = 0
 	}
 	// --- END NEW ---
 
@@ -159,6 +186,7 @@ func init() {
 		envoyURL, envoyCommCheckURL, kafkaBroker, kafkaTopic, fetchInterval)
 	log.Printf("Current OWNER token expires at %s (Unix: %d)", time.Unix(ownerTokenExpiry, 0).UTC().Format(time.RFC3339), ownerTokenExpiry)
 	log.Printf("Current INSTALLER token expires at %s (Unix: %d)", time.Unix(installerTokenExpiry, 0).UTC().Format(time.RFC3339), installerTokenExpiry)
+	log.Printf("Envoy communication check is %s", map[bool]string{true: "ENABLED", false: "DISABLED"}[enableCommCheck])
 }
 
 func main() {
@@ -192,14 +220,22 @@ func main() {
 
 	// Initial fetch to populate state (using the potentially newly refreshed OWNER token)
 	log.Println("Performing initial fetch to populate state...")
-	fetchAndPopulateState(ctx)
+	// --- MODIFIED: Call appropriate initial fetch function based on enableCommCheck ---
+	if enableCommCheck {
+		// If comm check is enabled, perform initial fetch via the trigger function
+		fetchTriggerAndPublish(ctx, writer)
+	} else {
+		// If comm check is disabled, perform initial fetch by just fetching data
+		fetchAndPopulateState(ctx) // This function only fetches data and populates state
+	}
+	// --- END MODIFIED ---
 
 	log.Println("Initial state populated. Starting periodic fetching and publishing.")
 
 	for {
 		select {
 		case <-ticker.C:
-			// --- NEW: Check BOTH token expiries before each cycle ---
+			// --- NEW: Check token expiries before each cycle ---
 			// Refresh Owner token if needed
 			if time.Now().Unix()+300 >= ownerTokenExpiry { // Check 5 minutes before expiry
 				log.Println("Owner token is expired or nearing expiry. Attempting to refresh OWNER token...")
@@ -228,8 +264,8 @@ func main() {
 				}
 			}
 
-			// Refresh Installer token if needed
-			if time.Now().Unix()+300 >= installerTokenExpiry { // Check 5 minutes before expiry
+			// Refresh Installer token if needed (only if comm check is enabled)
+			if enableCommCheck && (time.Now().Unix()+300 >= installerTokenExpiry) { // Check 5 minutes before expiry
 				log.Println("Installer token is expired or nearing expiry. Attempting to refresh INSTALLER token...")
 				err := performInstallerTokenRefresh()
 				if err != nil {
@@ -257,8 +293,13 @@ func main() {
 			}
 			// --- END NEW ---
 
-			// Proceed with fetching and publishing using the current (potentially refreshed) tokens
-			fetchTriggerAndPublish(ctx, writer)
+			// --- MODIFIED: Call appropriate fetch function based on enableCommCheck ---
+			if enableCommCheck {
+				fetchTriggerAndPublish(ctx, writer)
+			} else {
+				fetchAndPublishOnly(ctx, writer) // Call the new function that only fetches data
+			}
+			// --- END MODIFIED ---
 		case <-ctx.Done():
 			log.Println("Context cancelled, shutting down.")
 			return
@@ -299,9 +340,9 @@ func performInstallerTokenRefresh() error {
 }
 
 // fetchAndPopulateState fetches data from Envoy and populates the lastReportDates map
-// Used on initial startup. Uses the OWNER token.
+// Used on initial startup when comm check is DISABLED. Uses the OWNER token.
 func fetchAndPopulateState(ctx context.Context) {
-	log.Printf("Attempting initial fetch from Envoy at %s", envoyURL)
+	log.Printf("Attempting initial fetch from Envoy at %s (Comm Check Disabled)", envoyURL)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", envoyURL, nil)
 	if err != nil {
@@ -492,3 +533,103 @@ func fetchTriggerAndPublish(ctx context.Context, writer *kafka.Writer) {
 		log.Println("No new inverter data to publish in this cycle after trigger.")
 	}
 }
+
+// --- NEW: Function to fetch data and publish without triggering comm check ---
+func fetchAndPublishOnly(ctx context.Context, writer *kafka.Writer) {
+	log.Printf("Attempting to fetch data from Envoy at %s (Comm Check Disabled)", envoyURL)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", envoyURL, nil)
+	if err != nil {
+		log.Printf("Error creating HTTP request for data fetch (no trigger): %v", err)
+		return
+	}
+
+	req.Header.Add("Accept", "application/json")
+	req.Header.Add("Authorization", "Bearer "+envoyOwnerToken) // Use the OWNER token
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error making HTTP request for data fetch (no trigger): %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Envoy returned non-OK status for data fetch (no trigger) from %s: %d %s", envoyURL, resp.StatusCode, resp.Status)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading Envoy response body for data fetch (no trigger): %v", err)
+		return
+	}
+
+	var inverters []Inverter
+	err = json.Unmarshal(body, &inverters)
+	if err != nil {
+		log.Printf("Error unmarshalling Envoy response JSON for data fetch (no trigger): %v", err)
+		return
+	}
+
+	log.Printf("Successfully fetched data for %d inverters (no trigger).", len(inverters))
+
+	var messages []kafka.Message
+	newReportsCount := 0
+
+	for _, inverter := range inverters {
+		lastSeenDate, exists := lastReportDates[inverter.SerialNumber]
+
+		if !exists || inverter.LastReportDate > lastSeenDate {
+			log.Printf("New data for panel %s (Current Date: %d, Last Seen: %d)",
+				inverter.SerialNumber, inverter.LastReportDate, lastSeenDate)
+
+			panelData := PanelData{
+				SerialNumber: inverter.SerialNumber,
+				Timestamp:    time.Now().UTC(),
+				Watts:        inverter.LastReportWatts,
+			}
+
+			panelDataJSON, err := json.Marshal(panelData)
+			if err != nil {
+				log.Printf("Error marshalling panel data for serial %s: %v", inverter.SerialNumber, err)
+				continue
+			}
+
+			msg := kafka.Message{
+				Key:   []byte(panelData.SerialNumber),
+				Value: panelDataJSON,
+				Time:  panelData.Timestamp,
+			}
+
+			messages = append(messages, msg)
+			newReportsCount++
+
+			lastReportDates[inverter.SerialNumber] = inverter.LastReportDate
+		} // else { log.Printf("No new data for panel %s ...") }
+	}
+
+	if len(messages) > 0 {
+		log.Printf("Attempting to publish %d new messages to Kafka (no trigger).", len(messages))
+		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		err = writer.WriteMessages(writeCtx, messages...)
+		if err != nil {
+			log.Printf("Error writing messages to Kafka (no trigger): %v", err)
+		} else {
+			log.Printf("Successfully published data for %d new panels to Kafka (no trigger).", len(messages))
+		}
+	} else {
+		log.Println("No new inverter data to publish in this cycle (no trigger).")
+	}
+}
+
+// --- END NEW ---

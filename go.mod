@@ -1,4 +1,4 @@
-module my/enphase_publisher
+module enphase
 
 go 1.22.2
 

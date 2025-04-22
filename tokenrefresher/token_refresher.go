@@ -1,7 +1,7 @@
 package tokenrefresher // Use a separate package for better organization
 
 import (
-	"bytes" // Needed for sending JSON body in POST requests
+	//"bytes" // Needed for sending JSON body in POST requests
 	"encoding/json"
 	"fmt"
 	"io"
